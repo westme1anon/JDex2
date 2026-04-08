@@ -37,6 +37,7 @@ public class JSHook implements IXposedHookLoadPackage {
     private static boolean innerclassesFilter = false;
     private static boolean nativeLoaded = false;
     private static boolean invokeDebugger = false;
+    private static boolean invokeConstructors = false;
     private final HashSet<DexFile> dumpedDexFiles = new HashSet<>();
 
     private static final String[] CLASS_FILTER_PREFIXES = {
@@ -271,8 +272,8 @@ public class JSHook implements IXposedHookLoadPackage {
                 // 选择任意一个构造方法即可
                 Constructor<?> target = constructors[0];
                 target.setAccessible(true);
-
-                Set<XC_MethodHook.Unhook> unhooks = XposedBridge.hookAllConstructors(clazz, BLOCK_CONSTRUCTOR);
+                XC_MethodHook.Unhook unhook = XposedBridge.hookMethod(target, BLOCK_CONSTRUCTOR);
+//                Set<XC_MethodHook.Unhook> unhooks = XposedBridge.hookAllConstructors(clazz, BLOCK_CONSTRUCTOR);
                 try {
                     // 获取参数列表，通过正确的参数类型调用可以避免在调用中途遇到无法预期的拦截
                     Object[] args = makeDefaultArgs(target.getParameterTypes());
@@ -282,9 +283,7 @@ public class JSHook implements IXposedHookLoadPackage {
                 } catch (Throwable ignored) {
                 } finally {
                     // 为了防止某些加固通过检测方法是否被转为Native方法来检测Hook，无论构造是否成功都要解除Hook
-                    for (XC_MethodHook.Unhook unhook : unhooks) {
-                        unhook.unhook();
-                    }
+                    unhook.unhook();
                 }
             } catch (Throwable e) {
                 Log.e(ErrTAG, "Failed: " + name, e);
@@ -325,11 +324,40 @@ public class JSHook implements IXposedHookLoadPackage {
         Log.e(TAG, "doDump: found " + allDexFile.size() + " DexFiles in " + loader);
         for (DexFile dexFile : allDexFile) {
             if (dexFile != null) {
+                if(isDexAlreadyDumped(dexFile, outDir)){
+                    continue;
+                }
                 String[] names = getAllClassName(dexFile, whiteList, blackList);
-                invokeAllConstructors(names, loader, blackList);
+                if(invokeConstructors){
+                    invokeAllConstructors(names, loader, blackList);
+                }
                 dumpDex(dexFile, outDir);
             }
         }
+    }
+    private boolean isDexAlreadyDumped(DexFile dexFile, String outDir) {
+        try {
+            Object cookie = XposedHelpers.getObjectField(dexFile, "mCookie");
+            if (!(cookie instanceof long[])) return false;
+
+            long[] dexSizes = getDexSizesByCookie((long[]) cookie);
+            if (dexSizes == null || dexSizes.length == 0) return false;
+
+            // 构造路径检查
+            for (long size : dexSizes) {
+                File dexFile2 = new File(outDir + size + ".dex");
+                if (!dexFile2.exists()) {
+                    // 有 dex 没 dump 过，不能跳过
+                    return false;
+                }
+            }
+
+            Log.e(TAG, "All DEX in this cookie already dumped, skip invoke. sizes=" + Arrays.toString(dexSizes));
+            return true;
+        } catch (Throwable t) {
+            Log.e(ErrTAG, "isDexAlreadyDumped check failed", t);
+        }
+        return false;
     }
 
     @Override
@@ -337,14 +365,20 @@ public class JSHook implements IXposedHookLoadPackage {
         // 根据TARGET_FILE判断是否是我们想要脱壳的APP
         // 使用前记得给予目标APP内存读写权限
         Properties props = new Properties();
-        try (InputStream input = new FileInputStream("/sdcard/config.properties")) {
-            props.load(input);
+        try (InputStream input = new FileInputStream("/data/data/" + loadPackageParam.packageName + "/files/config.properties")) {
+                props.load(input);
+        } catch (Throwable e){
+//            Log.e(ErrTAG, "Load config failed!" + e);
         }
 
         String targetApp = props.getProperty("targetApp");
+        if(!targetApp.equals(loadPackageParam.packageName)){
+            return;
+        }
         invokeDebugger = Boolean.parseBoolean(props.getProperty("invokeDebugger"));
         boolean hook = Boolean.parseBoolean(props.getProperty("hook"));
         innerclassesFilter = Boolean.parseBoolean(props.getProperty("innerclassesFilter"));
+        invokeConstructors = Boolean.parseBoolean(props.getProperty("invokeConstructors"));
 
         // 使用","分隔多个黑名单/白名单字符串
         // 使用白名单进行类的筛选，避免触发其它无法预知的逻辑导致App崩溃（也可以不设置白名单和黑名单进行脱壳）
@@ -371,7 +405,7 @@ public class JSHook implements IXposedHookLoadPackage {
         if (!loadPackageParam.packageName.equals(targetApp))
             return;
         LogInfo(loadPackageParam);
-        final String outDir = "/sdcard/dumpDex/" + loadPackageParam.packageName + "/";
+        final String outDir = "/data/data/" + loadPackageParam.packageName + "/dumpDex/";
         File dir = new File(outDir);
         if (!dir.exists() && !dir.mkdirs()) {
             Log.e(TAG, "Failed to create output directory: " + outDir);
@@ -480,11 +514,17 @@ public class JSHook implements IXposedHookLoadPackage {
                         // 调用DexFile内部的getClassNameList方法获取所有的Class名称，然后去进行主动调用
                         for (DexFile dexFile : allDexFile) {
                             if (dexFile != null) {
-                                // 获取每一个DexFile的方法之后主动调用
+                                // 如果该 DEX 已经被 dump 过直接跳过
+                                if(isDexAlreadyDumped(dexFile, outDir)){
+                                    continue;
+                                }
                                 String[] names = getAllClassName(dexFile, whiteList, blackList);
-                                invokeAllConstructors(names, (BaseDexClassLoader) realLoader,blackList);
-//                                invokeTest(realLoader, "");
-                                // 将Dex文件dump到输出目录
+                                if (invokeConstructors) {
+                                    // 只有未 dump 过的 DEX 才需要主动调用触发回填
+                                    invokeAllConstructors(names, (BaseDexClassLoader) realLoader, blackList);
+                                }
+
+                                // dump 仍然执行（dumpDex 内部有去重逻辑，会自动跳过）
                                 dumpDex(dexFile, outDir);
                             }
                         }
@@ -498,5 +538,6 @@ public class JSHook implements IXposedHookLoadPackage {
     }
 
     public static native void dumpDexByCookie(long[] cookie, String outDir);
+    public static native long[] getDexSizesByCookie(long[] cookie);
 
 }

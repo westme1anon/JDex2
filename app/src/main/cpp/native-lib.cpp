@@ -175,4 +175,55 @@ Java_com_jsnow_jdex2_JSHook_dumpDexByCookie(JNIEnv *env, jclass clazz, jlongArra
     env->ReleaseLongArrayElements(cookie, cookieElements, 0);
     env->ReleaseStringUTFChars(outDir, outDirStr);
 
+
+
+}
+
+extern "C"
+JNIEXPORT jlongArray JNICALL
+Java_com_jsnow_jdex2_JSHook_getDexSizesByCookie(JNIEnv *env, jclass clazz, jlongArray cookie) {
+
+    if (cookie == nullptr) return nullptr;
+
+    jsize cookieLen = env->GetArrayLength(cookie);
+    if (cookieLen < 1) return nullptr;
+
+    jlong* cookieElements = env->GetLongArrayElements(cookie, nullptr);
+    if (cookieElements == nullptr) return nullptr;
+
+    // 收集所有有效的 fileSize
+    std::vector<jlong> sizes;
+
+    for (int i = 0; i < cookieLen; i++) {
+        jlong dexFilePtr = cookieElements[i];
+        if (dexFilePtr == 0) continue;
+
+        const uint8_t* begin = findBegin(dexFilePtr);
+        if (begin == nullptr) continue;
+
+        uint32_t fileSize = getDexFileSize(begin);
+
+        if (fileSize < 0x70 || fileSize > 100 * 1024 * 1024) {
+            LOGE("getDexSizes: cookie[%d] unreasonable file_size=%u, skip", i, fileSize);
+            continue;
+        }
+
+        if (!isDexRegionReadable(begin, fileSize)) {
+            LOGE("getDexSizes: cookie[%d] dex region not readable, skip", i);
+            continue;
+        }
+
+        sizes.push_back((jlong)fileSize);
+    }
+
+    env->ReleaseLongArrayElements(cookie, cookieElements, 0);
+
+    // 构造 jlongArray 返回
+    jlongArray result = env->NewLongArray((jsize)sizes.size());
+    if (result != nullptr && !sizes.empty()) {
+        env->SetLongArrayRegion(result, 0, (jsize)sizes.size(), sizes.data());
+    }
+
+    LOGE("getDexSizes: found %zu valid dex files", sizes.size());
+    return result;
 }
